@@ -1,0 +1,37 @@
+# Copy this file to config.toml and replace every placeholder.
+# config.toml contains secrets and is intentionally ignored by Git.
+
+# [[gateway]]
+# type = "wecom"
+# Create a WeCom intelligent Bot, then obtain these values from the Bot
+# management page.
+# bot_id = "your_bot_id"
+# secret = "your_bot_secret"
+# websocket_url = "wss://openws.work.weixin.qq.com"
+
+# open: accept all users; allowlist: accept only the matching user IDs;
+# disabled: ignore messages.
+dm_policy = "open"
+group_policy = "open"
+dm_allow_from = []
+group_allow_from = []
+
+[[gateway]]
+type = "http"
+listen_addr = "127.0.0.1:3000"
+bearer_token = "replace_with_a_long_random_token"
+
+[model]
+# An OpenAI Chat Completions compatible endpoint.
+api_key = "your api key"
+base_url = "https://api.deepseek.com"
+model = "deepseek-flash"
+
+[agent]
+system_prompt = "You are a helpful assistant. Reply in the user's language and keep answers concise."
+# Number of completed user/assistant turns retained for each DM or group.
+max_history_messages = 12
+
+[log]
+# off, error, warn, info, debug, or trace.
+level = "info"
