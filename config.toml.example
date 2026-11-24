@@ -26,11 +26,19 @@ bearer_token = "replace_with_a_long_random_token"
 api_key = "sk-cee5a3bbf6f249f2b8449529ff293a75"
 base_url = "https://api.deepseek.com"
 model = "deepseek-flash"
+# Optional. The model context window in tokens. When this and the model metadata are
+# unavailable, conversation compression is disabled with a warning.
+# context_length = 1_000_000
 
 [agent]
 system_prompt = "You are a helpful assistant. Reply in the user's language and keep answers concise."
 # Number of completed user/assistant turns retained for each DM or group.
 max_history_messages = 12
+# Optional. Compress once a conversation reaches this fraction of its context window.
+# Defaults to 0.50.
+# compression_threshold_percent = 0.50
+# Maximum background compression attempts after one response. Defaults to 3.
+max_compression_attempts = 3
 
 [log]
 # off, error, warn, info, debug, or trace.

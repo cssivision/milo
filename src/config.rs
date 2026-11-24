@@ -51,8 +51,8 @@ pub struct ModelConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
-    #[serde(default = "defaults::context_window_tokens")]
-    pub context_window_tokens: usize,
+    #[serde(default)]
+    pub context_length: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,8 +68,10 @@ pub struct AgentConfig {
     pub system_prompt: String,
     #[serde(default = "defaults::max_history_messages")]
     pub max_history_messages: usize,
-    #[serde(default = "defaults::context_compression_threshold")]
-    pub context_compression_threshold: f64,
+    #[serde(default)]
+    pub compression_threshold_percent: Option<f64>,
+    #[serde(default = "defaults::max_compression_attempts")]
+    pub max_compression_attempts: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -113,13 +115,18 @@ impl Config {
         required("model.api_key", &self.model.api_key)?;
         required("model.base_url", &self.model.base_url)?;
         required("model.model", &self.model.model)?;
-        if self.model.context_window_tokens == 0 {
-            bail!("model.context_window_tokens must be greater than zero");
+        if self.model.context_length == Some(0) {
+            bail!("model.context_length must be greater than zero");
         }
-        if !(0.0..=1.0).contains(&self.agent.context_compression_threshold)
-            || self.agent.context_compression_threshold == 0.0
+        if self
+            .agent
+            .compression_threshold_percent
+            .is_some_and(|threshold| !(0.0..=1.0).contains(&threshold) || threshold == 0.0)
         {
-            bail!("agent.context_compression_threshold must be greater than zero and at most one");
+            bail!("agent.compression_threshold_percent must be greater than zero and at most one");
+        }
+        if self.agent.max_compression_attempts == 0 {
+            bail!("agent.max_compression_attempts must be greater than zero");
         }
         if self.storage_dir.as_os_str().is_empty() {
             bail!("storage_dir cannot be empty");
@@ -157,8 +164,16 @@ impl Default for AgentConfig {
         Self {
             system_prompt: defaults::system_prompt(),
             max_history_messages: defaults::max_history_messages(),
-            context_compression_threshold: defaults::context_compression_threshold(),
+            compression_threshold_percent: None,
+            max_compression_attempts: defaults::max_compression_attempts(),
         }
+    }
+}
+
+impl AgentConfig {
+    pub fn compression_threshold_percent(&self) -> f64 {
+        self.compression_threshold_percent
+            .unwrap_or_else(defaults::compression_threshold_percent)
     }
 }
 
@@ -212,8 +227,8 @@ mod defaults {
     const SYSTEM_PROMPT: &str =
         "You are a helpful assistant. Reply in the user's language and keep answers concise.";
     const MAX_HISTORY_MESSAGES: usize = 12;
-    const CONTEXT_WINDOW_TOKENS: usize = 1_000_000;
-    const CONTEXT_COMPRESSION_THRESHOLD: f64 = 0.5;
+    const COMPRESSION_THRESHOLD_PERCENT: f64 = 0.5;
+    const MAX_COMPRESSION_ATTEMPTS: usize = 3;
     const LOG_LEVEL: &str = "info";
     const STORAGE_DIR: &str = ".milo";
     const PROFILE_DIR: &str = ".milo/profile";
@@ -238,12 +253,12 @@ mod defaults {
         MAX_HISTORY_MESSAGES
     }
 
-    pub(super) const fn context_window_tokens() -> usize {
-        CONTEXT_WINDOW_TOKENS
+    pub(super) const fn compression_threshold_percent() -> f64 {
+        COMPRESSION_THRESHOLD_PERCENT
     }
 
-    pub(super) const fn context_compression_threshold() -> f64 {
-        CONTEXT_COMPRESSION_THRESHOLD
+    pub(super) const fn max_compression_attempts() -> usize {
+        MAX_COMPRESSION_ATTEMPTS
     }
 
     pub(super) fn log_level() -> String {
@@ -279,7 +294,7 @@ mod tests {
                 api_key: "key".into(),
                 base_url: "https://example.com/v1".into(),
                 model: "model".into(),
-                context_window_tokens: defaults::context_window_tokens(),
+                context_length: None,
             },
             agent: AgentConfig::default(),
             log: LogConfig::default(),
@@ -315,5 +330,55 @@ mod tests {
         config.validate().unwrap();
         assert!(matches!(&config.gateway[0], GatewayConfig::Wecom(_)));
         assert!(matches!(&config.gateway[1], GatewayConfig::Http(_)));
+    }
+
+    #[test]
+    fn context_compression_is_optional_with_sensible_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+                [[gateway]]
+                type = "http"
+                bearer_token = "token"
+
+                [model]
+                api_key = "key"
+                base_url = "https://example.com/v1"
+                model = "test"
+            "#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        assert_eq!(config.model.context_length, None);
+        assert_eq!(config.agent.compression_threshold_percent(), 0.5);
+        assert_eq!(config.agent.max_compression_attempts, 3);
+    }
+
+    #[test]
+    fn rejects_invalid_context_compression_settings() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [[gateway]]
+                type = "http"
+                bearer_token = "token"
+
+                [model]
+                api_key = "key"
+                base_url = "https://example.com/v1"
+                model = "test"
+            "#,
+        )
+        .unwrap();
+
+        config.model.context_length = Some(0);
+        assert!(config.validate().is_err());
+
+        config.model.context_length = Some(1);
+        config.agent.compression_threshold_percent = Some(1.1);
+        assert!(config.validate().is_err());
+
+        config.agent.compression_threshold_percent = Some(0.5);
+        config.agent.max_compression_attempts = 0;
+        assert!(config.validate().is_err());
     }
 }
