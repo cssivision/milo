@@ -11,11 +11,15 @@ path = "src/bin/main.rs"
 anyhow = "1.0"
 async-trait = "0.1"
 async-stream = "0.3"
+aws-lc-rs = "1.19"
 axum = "0.8"
+base64 = "0.23"
 env_logger = "0.11"
 futures-util = "0.3"
 getopts = "0.2"
 log = "0.4"
+mime_guess = "2.0"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rig = "0.47"
 rig-memory = { version = "0.47", features = ["fs"] }
 serde = { version = "1.0", features = ["derive"] }

@@ -87,26 +87,66 @@ response:
 curl -N http://127.0.0.1:3000/v1/chat/stream \
   -H 'Authorization: Bearer replace_with_a_long_random_token' \
   -H 'Content-Type: application/json' \
-  -d '{"message":"你好","session_id":"demo","user_id":"alice"}'
+  -d '{"message":"你好","session_id":"demo","profile_id":"alice"}'
 ```
 
+`profile_id` is required. Provide a stable value to isolate sessions and
+profile files between HTTP users. `session_id` is optional and is generated
+when absent.
+
+Requests can carry media through `attachments`. Each attachment accepts
+`content_type`, optional `file_name` and metadata, plus exactly one of:
+
+- `data`: Base64-encoded bytes.
+- `uri`: an HTTP(S) URL. Milo permits only public resolved IPs, follows at
+  most three redirects, limits each attachment to 20 MiB, and limits the
+  request total to 50 MiB.
+
+```json
+{
+  "message": "Describe this image",
+  "profile_id": "alice",
+  "session_id": "demo",
+  "attachments": [
+    {
+      "content_type": "image/png",
+      "file_name": "diagram.png",
+      "data": "iVBORw0KGgoAAAANSUhEUg..."
+    }
+  ]
+}
+```
+
+Images, supported audio and video formats, PDFs, and UTF-8 text documents are
+converted to Rig multimodal user content. The selected provider/model must
+support the supplied modality; unsupported MIME types fail the agent request.
+
 It emits `text_delta`, `reasoning_delta`, `tool_call`, `tool_result`,
-`completion_call`, `retried`, `completed`, and `error` SSE events.
+`completion_call`, `retried`, `completed`, and `error` SSE events. Every SSE
+data payload is a normalized outbound message with `chat_id`, `text`,
+`msg_type`, optional `reply_to_message_id`, and event-specific `metadata`.
 Tool calls and results are streamed as incremental events, followed by an event
 whose `completed` field is `true`. The final `completed` event contains the
 complete response text.
-Provide a stable `user_id` to isolate sessions and profile files between HTTP
-users.
 
 ### Persistent Conversations
 
 Rig's filesystem-backed conversation memory persists each
-`channel + user_id + session_id` under `.milo/sessions/`. Per-user
+`channel + profile_id + session_id` under `.milo/sessions/`. Per-user
 profiles remain in `.milo/profile/<user-hash>/user.md` and `soul.md`.
 
 `user.md` and `soul.md` are loaded into the system prompt for every request.
 The agent can selectively update its current user's `user.md` through the
 `profile` tool; it cannot modify `soul.md`.
+
+### WeCom Media
+
+WeCom long connections accept text, mixed text/image, voice transcription,
+image, file, and video callbacks. Image, file, and video payloads are
+downloaded and decrypted with their per-message AES key before they reach the
+agent. WeCom constrains ordinary image, voice, file, and video messages to
+direct messages. Outbound image, file, voice, and video messages require a
+platform `media_id`; Milo does not generate or upload media IDs itself.
 
 The application uses Tokio for the Bot WebSocket, reconnect and heartbeat
 tasks, and Rig's HTTP model requests.

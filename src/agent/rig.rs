@@ -1,12 +1,17 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
+use base64::Engine;
 use futures_util::StreamExt;
 use log::{info, warn};
 use rig::{
     agent::{AgentBuilder, MultiTurnStreamItem},
     catalog::ModelSpec,
     completion::{Effort, GenerationOptions, Reasoning},
+    message::{
+        Audio, AudioMediaType, DocumentContent, DocumentData, DocumentMediaType,
+        DocumentSourceKind, Image, ImageMediaType, MimeType, UserContent, Video, VideoMediaType,
+    },
     providers::openai::{OpenAI, OpenAIConfig},
     streaming::{Item, StreamEvent},
 };
@@ -167,21 +172,88 @@ impl<S: ProfileStore + 'static> RigAgent<S> {
         prompt
     }
 
-    async fn context_for(&self, profile_key: &str, message: &str) -> Result<(String, String)> {
+    async fn system_prompt_for(&self, profile_key: &str) -> Result<String> {
         let profile = self.profile_store.load(profile_key).await?;
-        Ok((message.to_owned(), self.system_prompt(&profile)))
+        Ok(self.system_prompt(&profile))
     }
+}
+
+fn user_content(message: &InboundMessage) -> Result<Vec<UserContent>> {
+    let mut content = vec![UserContent::text(message.text.clone())];
+
+    for attachment in &message.attachments {
+        let content_type = attachment
+            .content_type
+            .as_deref()
+            .context("attachment has no content_type")?;
+        let data = attachment
+            .data
+            .as_ref()
+            .context("attachment has no resolved data")?;
+        let source =
+            DocumentSourceKind::Base64(base64::engine::general_purpose::STANDARD.encode(data));
+
+        if let Some(media_type) = ImageMediaType::from_mime_type(content_type) {
+            content.push(UserContent::Image(Image {
+                data: source,
+                media_type: Some(media_type),
+                ..Image::default()
+            }));
+        } else if let Some(media_type) = AudioMediaType::from_mime_type(content_type) {
+            content.push(UserContent::Audio(Audio {
+                data: source,
+                media_type: Some(media_type),
+            }));
+        } else if let Some(media_type) = VideoMediaType::from_mime_type(content_type) {
+            content.push(UserContent::Video(Video {
+                data: source,
+                media_type: Some(media_type),
+                additional_params: None,
+            }));
+        } else if let Some(media_type) = DocumentMediaType::from_mime_type(content_type) {
+            let data = match media_type {
+                DocumentMediaType::TXT
+                | DocumentMediaType::RTF
+                | DocumentMediaType::HTML
+                | DocumentMediaType::CSS
+                | DocumentMediaType::MARKDOWN
+                | DocumentMediaType::CSV
+                | DocumentMediaType::XML
+                | DocumentMediaType::Javascript
+                | DocumentMediaType::Python => DocumentData::Text(
+                    String::from_utf8(data.clone())
+                        .context("text attachment is not valid UTF-8")?,
+                ),
+                DocumentMediaType::PDF => DocumentData::File(source),
+            };
+            content.push(UserContent::Document(DocumentContent {
+                data,
+                media_type: Some(media_type),
+                additional_params: None,
+            }));
+        } else {
+            anyhow::bail!("unsupported attachment content_type {content_type:?}");
+        }
+    }
+
+    Ok(content)
 }
 
 impl<S: ProfileStore + 'static> Agent for RigAgent<S> {
     fn respond_stream(&self, message: InboundMessage) -> AgentStream {
         let agent = self.clone();
         Box::pin(async_stream::try_stream! {
-            let _metadata = (message.channel, &message.sender_id, &message.message_id);
+            let sender_id = message
+                .source
+                .sender_id
+                .as_deref()
+                .context("inbound message has no sender_id")?;
+            let _metadata = (message.channel_type, sender_id, &message.platform_message_id);
             let session_key =
-                session_key(message.channel, &message.sender_id, &message.session_id);
-            let profile_key = profile_key(message.channel, &message.sender_id);
-            let (context, system_prompt) = agent.context_for(&profile_key, &message.text).await?;
+                session_key(message.channel_type, sender_id, &message.source.chat_id);
+            let profile_key = profile_key(message.channel_type, sender_id);
+            let system_prompt = agent.system_prompt_for(&profile_key).await?;
+            let context = user_content(&message)?;
             let rig_agent = AgentBuilder::new(agent.client.chat(&agent.model_name))
                 .name("milo")
                 .preamble(system_prompt)
@@ -196,7 +268,7 @@ impl<S: ProfileStore + 'static> Agent for RigAgent<S> {
                 .default_max_turns(2)
                 .build();
             let mut stream = rig_agent
-                .prompt(&context)
+                .prompt(context)
                 .conversation(session_key.clone())
                 .stream();
             let mut output = String::new();
@@ -345,6 +417,7 @@ async fn compact_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn session_key_is_user_scoped() {
@@ -384,5 +457,60 @@ mod tests {
         };
 
         assert!(CompactionPolicy::from_config(&model, &AgentConfig::default()).is_none());
+    }
+
+    #[test]
+    fn converts_image_attachments_to_user_content() {
+        let message = InboundMessage {
+            channel_type: Channel::Http,
+            platform_message_id: "message".into(),
+            msg_type: crate::gateway::GatewayInboundMessageType::Text,
+            text: "describe this".into(),
+            attachments: vec![crate::gateway::GatewayAttachment {
+                attachment_id: None,
+                content_type: Some("image/png".into()),
+                file_name: None,
+                data: Some(vec![1, 2, 3]),
+                uri: None,
+                metadata: HashMap::new(),
+            }],
+            source: crate::gateway::GatewayMessageSource {
+                chat_id: "session".into(),
+                sender_id: Some("alice".into()),
+                metadata: HashMap::new(),
+            },
+            metadata: HashMap::new(),
+        };
+
+        let content = user_content(&message).unwrap();
+
+        assert!(matches!(content[0], UserContent::Text(_)));
+        assert!(matches!(content[1], UserContent::Image(_)));
+    }
+
+    #[test]
+    fn rejects_unknown_attachment_types() {
+        let message = InboundMessage {
+            channel_type: Channel::Http,
+            platform_message_id: "message".into(),
+            msg_type: crate::gateway::GatewayInboundMessageType::Text,
+            text: "inspect this".into(),
+            attachments: vec![crate::gateway::GatewayAttachment {
+                attachment_id: None,
+                content_type: Some("application/zip".into()),
+                file_name: None,
+                data: Some(vec![1, 2, 3]),
+                uri: None,
+                metadata: HashMap::new(),
+            }],
+            source: crate::gateway::GatewayMessageSource {
+                chat_id: "session".into(),
+                sender_id: Some("alice".into()),
+                metadata: HashMap::new(),
+            },
+            metadata: HashMap::new(),
+        };
+
+        assert!(user_content(&message).is_err());
     }
 }

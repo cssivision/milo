@@ -1,30 +1,152 @@
+mod attachment;
 mod http;
 mod wecom;
 
-use std::{pin::Pin, sync::Arc};
+use std::{collections::HashMap, pin::Pin, sync::Arc};
 
 use anyhow::Result;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{Stream, StreamExt};
 use log::warn;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use attachment::resolve_attachments;
 pub use http::serve as serve_http;
 pub use wecom::WecomBot;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Channel {
     Wecom,
     Http,
 }
 
-#[derive(Debug, Clone)]
-pub struct InboundMessage {
-    pub channel: Channel,
-    pub session_id: String,
-    pub sender_id: String,
-    pub message_id: String,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GatewayAttachment {
+    #[serde(default)]
+    pub attachment_id: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(
+        default,
+        serialize_with = "serialize_base64",
+        deserialize_with = "deserialize_base64"
+    )]
+    pub data: Option<Vec<u8>>,
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[serde(default)]
+    pub metadata: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GatewayMessageSource {
+    pub chat_id: String,
+    #[serde(default)]
+    pub sender_id: Option<String>,
+    #[serde(default)]
+    pub metadata: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayInboundMessageType {
+    #[default]
+    Text,
+    Raw,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GatewayInboundMessage {
+    pub channel_type: Channel,
+    pub platform_message_id: String,
+    #[serde(default)]
+    pub msg_type: GatewayInboundMessageType,
     pub text: String,
+    #[serde(default)]
+    pub attachments: Vec<GatewayAttachment>,
+    pub source: GatewayMessageSource,
+    #[serde(default)]
+    pub metadata: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayOutboundMessageType {
+    Text,
+    Markdown,
+    Card,
+    Image,
+    File,
+    Voice,
+    Video,
+    Raw,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GatewayOutboundMessage {
+    pub chat_id: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<String>,
+    pub msg_type: GatewayOutboundMessageType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, Value>,
+}
+
+impl GatewayOutboundMessage {
+    pub fn event(
+        chat_id: impl Into<String>,
+        reply_to_message_id: Option<String>,
+        event_type: GatewayEventType,
+        msg_type: GatewayOutboundMessageType,
+        text: impl Into<String>,
+        mut metadata: HashMap<String, Value>,
+    ) -> Self {
+        metadata.insert(
+            "event".to_owned(),
+            Value::String(event_type.as_str().to_owned()),
+        );
+        Self {
+            chat_id: chat_id.into(),
+            text: text.into(),
+            reply_to_message_id,
+            msg_type,
+            media_id: None,
+            description: None,
+            metadata,
+        }
+    }
+}
+
+pub type InboundMessage = GatewayInboundMessage;
+
+fn serialize_base64<S>(
+    data: &Option<Vec<u8>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    data.as_ref()
+        .map(|data| STANDARD.encode(data))
+        .serialize(serializer)
+}
+
+fn deserialize_base64<'de, D>(deserializer: D) -> std::result::Result<Option<Vec<u8>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let data = Option::<String>::deserialize(deserializer)?;
+    data.map(|data| STANDARD.decode(data).map_err(serde::de::Error::custom))
+        .transpose()
 }
 
 #[derive(Debug, Clone)]
@@ -149,14 +271,46 @@ mod tests {
     async fn dispatches_a_normalized_message_to_the_agent() {
         let gateway = GatewayRuntime::new(EchoAgent);
         let mut stream = gateway.dispatch_stream(InboundMessage {
-            channel: Channel::Wecom,
-            session_id: "dm:user-1".into(),
-            sender_id: "user-1".into(),
-            message_id: "message-1".into(),
+            channel_type: Channel::Wecom,
+            platform_message_id: "message-1".into(),
+            msg_type: GatewayInboundMessageType::Text,
             text: "hello".into(),
+            attachments: Vec::new(),
+            source: GatewayMessageSource {
+                chat_id: "dm:user-1".into(),
+                sender_id: Some("user-1".into()),
+                metadata: HashMap::new(),
+            },
+            metadata: HashMap::new(),
         });
         let reply = stream.next().await.unwrap().unwrap();
 
         assert!(matches!(reply, AgentEvent::TextDelta(text) if text == "hello"));
+    }
+
+    #[test]
+    fn attachment_data_is_base64_encoded_in_json() {
+        let attachment: GatewayAttachment =
+            serde_json::from_str(r#"{"content_type":"image/png","data":"AQID"}"#).unwrap();
+        assert_eq!(attachment.data, Some(vec![1, 2, 3]));
+        assert_eq!(
+            serde_json::to_value(attachment).unwrap()["data"],
+            serde_json::Value::String("AQID".to_owned())
+        );
+    }
+
+    #[test]
+    fn outbound_events_include_their_event_type() {
+        let message = GatewayOutboundMessage::event(
+            "chat",
+            Some("message".into()),
+            GatewayEventType::TextDelta,
+            GatewayOutboundMessageType::Text,
+            "hello",
+            HashMap::new(),
+        );
+
+        assert_eq!(message.metadata["event"], "text_delta");
+        assert_eq!(message.text, "hello");
     }
 }

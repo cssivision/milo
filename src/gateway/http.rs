@@ -1,4 +1,4 @@
-use std::{convert::Infallible, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, convert::Infallible, net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -15,10 +15,15 @@ use uuid::Uuid;
 
 use crate::{
     config::HttpConfig,
-    gateway::{AgentEvent, Channel, GatewayEventType, GatewayRuntime, InboundMessage},
+    gateway::{
+        AgentEvent, Channel, GatewayAttachment, GatewayEventType, GatewayInboundMessageType,
+        GatewayMessageSource, GatewayOutboundMessage, GatewayOutboundMessageType, GatewayRuntime,
+        InboundMessage, resolve_attachments,
+    },
 };
 
 #[derive(Clone)]
+
 struct HttpState {
     gateway: GatewayRuntime,
     bearer_token: Arc<str>,
@@ -29,8 +34,11 @@ struct ChatRequest {
     message: String,
     #[serde(default)]
     session_id: Option<String>,
+    profile_id: String,
     #[serde(default)]
-    user_id: Option<String>,
+    attachments: Vec<GatewayAttachment>,
+    #[serde(default)]
+    metadata: HashMap<String, serde_json::Value>,
 }
 
 pub async fn serve(config: HttpConfig, gateway: GatewayRuntime) -> Result<()> {
@@ -78,57 +86,95 @@ async fn chat_stream(
         .session_id
         .filter(|id| !id.trim().is_empty())
         .unwrap_or_else(|| format!("http:{}", Uuid::new_v4()));
-    let sender_id = request
-        .user_id
-        .filter(|id| !id.trim().is_empty())
-        .unwrap_or_else(|| "http".to_owned());
+    let profile_id = request.profile_id.trim();
+    if profile_id.is_empty() {
+        log::error!("profile_id is required");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let attachments = resolve_attachments(request.attachments)
+        .await
+        .map_err(|error| {
+            warn!("HTTP Gateway rejected attachments: {error}");
+            StatusCode::BAD_REQUEST
+        })?;
     info!("HTTP Gateway started a stream: session_id={session_id}");
     let inbound = InboundMessage {
-        channel: Channel::Http,
-        sender_id,
-        message_id: Uuid::new_v4().to_string(),
-        session_id,
+        channel_type: Channel::Http,
+        platform_message_id: Uuid::new_v4().to_string(),
+        msg_type: GatewayInboundMessageType::Text,
         text: message.to_owned(),
+        attachments,
+        source: GatewayMessageSource {
+            chat_id: session_id,
+            sender_id: Some(profile_id.to_owned()),
+            metadata: HashMap::new(),
+        },
+        metadata: request.metadata,
     };
-    let stream = state.gateway.dispatch_stream(inbound).map(|event| {
-        let event = match event {
-            Ok(AgentEvent::TextDelta(text)) => sse_event(
+    let outbound_context = (
+        inbound.source.chat_id.clone(),
+        Some(inbound.platform_message_id.clone()),
+    );
+    let stream = state.gateway.dispatch_stream(inbound).map(move |event| {
+        let (event_type, msg_type, text, metadata) = match event {
+            Ok(AgentEvent::TextDelta(text)) => (
                 GatewayEventType::TextDelta,
-                serde_json::json!({ "text": text }),
+                GatewayOutboundMessageType::Text,
+                text,
+                HashMap::new(),
             ),
-            Ok(AgentEvent::ReasoningDelta(text)) => sse_event(
+            Ok(AgentEvent::ReasoningDelta(text)) => (
                 GatewayEventType::ReasoningDelta,
-                serde_json::json!({ "text": text }),
+                GatewayOutboundMessageType::Raw,
+                text,
+                HashMap::new(),
             ),
-            Ok(AgentEvent::ToolCall(tool_call)) => {
-                sse_event(GatewayEventType::ToolCall, serde_json::json!(tool_call))
-            }
-            Ok(AgentEvent::ToolResult(tool_result)) => {
-                sse_event(GatewayEventType::ToolResult, serde_json::json!(tool_result))
-            }
-            Ok(AgentEvent::CompletionCall(call)) => {
-                sse_event(GatewayEventType::CompletionCall, serde_json::json!(call))
-            }
-            Ok(AgentEvent::Retried { turn }) => sse_event(
-                GatewayEventType::Retried,
-                serde_json::json!({ "turn": turn }),
+            Ok(AgentEvent::ToolCall(tool_call)) => raw_event(
+                GatewayEventType::ToolCall,
+                "tool_call",
+                serde_json::json!(tool_call),
             ),
-            Ok(AgentEvent::Completed(text)) => sse_event(
+            Ok(AgentEvent::ToolResult(tool_result)) => raw_event(
+                GatewayEventType::ToolResult,
+                "tool_result",
+                serde_json::json!(tool_result),
+            ),
+            Ok(AgentEvent::CompletionCall(call)) => raw_event(
+                GatewayEventType::CompletionCall,
+                "completion_call",
+                serde_json::json!(call),
+            ),
+            Ok(AgentEvent::Retried { turn }) => {
+                raw_event(GatewayEventType::Retried, "turn", serde_json::json!(turn))
+            }
+            Ok(AgentEvent::Completed(text)) => (
                 GatewayEventType::Completed,
-                serde_json::json!({ "text": text }),
+                GatewayOutboundMessageType::Text,
+                text,
+                HashMap::new(),
             ),
-            Ok(AgentEvent::Error(message)) => sse_event(
+            Ok(AgentEvent::Error(message)) => (
                 GatewayEventType::Error,
-                serde_json::json!({ "message": message }),
+                GatewayOutboundMessageType::Text,
+                message,
+                HashMap::new(),
             ),
-            Err(_) => sse_event(
+            Err(_) => (
                 GatewayEventType::Error,
-                serde_json::json!({
-                    "message": "抱歉，暂时无法生成回复，请稍后重试。"
-                }),
+                GatewayOutboundMessageType::Text,
+                "抱歉，暂时无法生成回复，请稍后重试。".to_owned(),
+                HashMap::new(),
             ),
         };
-        Ok::<Event, Infallible>(event)
+        let outbound = GatewayOutboundMessage::event(
+            outbound_context.0.clone(),
+            outbound_context.1.clone(),
+            event_type,
+            msg_type,
+            text,
+            metadata,
+        );
+        Ok::<Event, Infallible>(sse_event(event_type, serde_json::json!(outbound)))
     });
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
@@ -148,6 +194,24 @@ fn sse_event(event: GatewayEventType, data: serde_json::Value) -> Event {
         .data(data.to_string())
 }
 
+fn raw_event(
+    event_type: GatewayEventType,
+    key: &str,
+    value: serde_json::Value,
+) -> (
+    GatewayEventType,
+    GatewayOutboundMessageType,
+    String,
+    HashMap<String, serde_json::Value>,
+) {
+    (
+        event_type,
+        GatewayOutboundMessageType::Raw,
+        String::new(),
+        HashMap::from([(key.to_owned(), value)]),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +223,27 @@ mod tests {
 
         assert!(is_authorized(&headers, "secret"));
         assert!(!is_authorized(&headers, "wrong"));
+    }
+
+    #[test]
+    fn profile_id_is_required() {
+        assert!(serde_json::from_str::<ChatRequest>(r#"{"message":"hello"}"#).is_err());
+        assert!(
+            serde_json::from_str::<ChatRequest>(r#"{"message":"hello","profile_id":""}"#).is_ok()
+        );
+    }
+
+    #[test]
+    fn parses_base64_attachments() {
+        let request: ChatRequest = serde_json::from_str(
+            r#"{
+                "message":"look",
+                "profile_id":"alice",
+                "attachments":[{"content_type":"image/png","data":"AQID"}]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(request.attachments[0].data, Some(vec![1, 2, 3]));
     }
 }
