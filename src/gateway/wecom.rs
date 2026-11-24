@@ -172,7 +172,7 @@ impl WecomBot {
 
         let mut stream = self.gateway.dispatch_stream(InboundMessage {
             channel: Channel::Wecom,
-            conversation_id: session_id(&message),
+            session_id: session_id(&message),
             sender_id: message.from.userid,
             message_id: message.msgid,
             text: message.text.content.trim().to_owned(),
@@ -188,8 +188,12 @@ impl WecomBot {
                     self.respond_stream(writer, &frame.headers.req_id, &stream_id, &content, false)
                         .await?;
                 }
-                AgentEvent::Reset => content.clear(),
-                AgentEvent::Finished(final_content) => {
+                AgentEvent::ReasoningDelta(_)
+                | AgentEvent::ToolCall(_)
+                | AgentEvent::ToolResult(_) => {}
+                AgentEvent::CompletionCall(_) => {}
+                AgentEvent::Retried { .. } => content.clear(),
+                AgentEvent::Completed(final_content) => {
                     self.respond_stream(
                         writer,
                         &frame.headers.req_id,
@@ -198,6 +202,12 @@ impl WecomBot {
                         true,
                     )
                     .await?;
+                    finished = true;
+                    break;
+                }
+                AgentEvent::Error(message) => {
+                    self.respond_stream(writer, &frame.headers.req_id, &stream_id, &message, true)
+                        .await?;
                     finished = true;
                     break;
                 }

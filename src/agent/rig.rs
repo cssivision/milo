@@ -6,6 +6,7 @@ use log::{info, warn};
 use rig::{
     agent::{AgentBuilder, MultiTurnStreamItem},
     catalog::ModelSpec,
+    completion::{Effort, GenerationOptions, Reasoning},
     providers::openai::{OpenAI, OpenAIConfig},
     streaming::{Item, StreamEvent},
 };
@@ -19,13 +20,17 @@ use crate::{
         profile::{Profile, ProfileStore},
         tools::ProfileTool,
     },
-    config::{AgentConfig, ModelConfig},
-    gateway::{Agent, AgentEvent, AgentStream, Channel, InboundMessage},
+    config::{AgentConfig, ModelConfig, ReasoningEffort},
+    gateway::{
+        Agent, AgentEvent, AgentStream, Channel, CompletionCallEvent, InboundMessage,
+        ToolCallEvent, ToolResultEvent,
+    },
 };
 
 pub struct RigAgent<S: ProfileStore> {
     client: OpenAI,
     model_name: String,
+    reasoning_effort: ReasoningEffort,
     settings: AgentConfig,
     profile_store: Arc<S>,
     conversation_store: DirStore,
@@ -62,6 +67,7 @@ impl<S: ProfileStore> Clone for RigAgent<S> {
         Self {
             client: self.client.clone(),
             model_name: self.model_name.clone(),
+            reasoning_effort: self.reasoning_effort,
             settings: self.settings.clone(),
             profile_store: self.profile_store.clone(),
             conversation_store: self.conversation_store.clone(),
@@ -70,12 +76,57 @@ impl<S: ProfileStore> Clone for RigAgent<S> {
     }
 }
 
-fn session_key(channel: Channel, sender_id: &str, conversation_id: &str) -> String {
-    format!("{channel:?}:{sender_id}:{conversation_id}")
+fn session_key(channel: Channel, sender_id: &str, session_id: &str) -> String {
+    format!("{channel:?}:{sender_id}:{session_id}")
 }
 
 fn profile_key(channel: Channel, sender_id: &str) -> String {
     format!("{channel:?}:{sender_id}")
+}
+
+fn tool_call_event(tool_call: rig::message::ToolCall) -> ToolCallEvent {
+    ToolCallEvent {
+        part: None,
+        id: Some(tool_call.id.to_string()),
+        name: Some(tool_call.function.name.to_string()),
+        arguments: serde_json::Value::Object(tool_call.function.arguments),
+        completed: true,
+    }
+}
+
+fn tool_result_event(
+    tool_result: rig::message::ToolResult,
+    index: Option<usize>,
+    count: Option<usize>,
+    completed: bool,
+) -> Result<ToolResultEvent> {
+    let content = tool_result
+        .content
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<serde_json::Result<_>>()?;
+
+    Ok(ToolResultEvent {
+        call_id: tool_result.call.to_string(),
+        name: tool_result.name.to_string(),
+        content,
+        is_error: tool_result.is_error,
+        index,
+        count,
+        completed,
+    })
+}
+
+fn reasoning(effort: ReasoningEffort) -> Reasoning {
+    match effort {
+        ReasoningEffort::Off => Reasoning::Off,
+        ReasoningEffort::Minimal => Reasoning::Effort(Effort::Minimal),
+        ReasoningEffort::Low => Reasoning::Effort(Effort::Low),
+        ReasoningEffort::Medium => Reasoning::Effort(Effort::Medium),
+        ReasoningEffort::High => Reasoning::Effort(Effort::High),
+        ReasoningEffort::XHigh => Reasoning::Effort(Effort::XHigh),
+        ReasoningEffort::Max => Reasoning::Effort(Effort::Max),
+    }
 }
 
 impl<S: ProfileStore + 'static> RigAgent<S> {
@@ -95,6 +146,7 @@ impl<S: ProfileStore + 'static> RigAgent<S> {
                 .with_base_url(&model.base_url)
                 .client(),
             model_name: model.model,
+            reasoning_effort: model.reasoning_effort,
             settings,
             profile_store: Arc::new(profile_store),
             conversation_store,
@@ -127,12 +179,15 @@ impl<S: ProfileStore + 'static> Agent for RigAgent<S> {
         Box::pin(async_stream::try_stream! {
             let _metadata = (message.channel, &message.sender_id, &message.message_id);
             let session_key =
-                session_key(message.channel, &message.sender_id, &message.conversation_id);
+                session_key(message.channel, &message.sender_id, &message.session_id);
             let profile_key = profile_key(message.channel, &message.sender_id);
             let (context, system_prompt) = agent.context_for(&profile_key, &message.text).await?;
             let rig_agent = AgentBuilder::new(agent.client.chat(&agent.model_name))
                 .name("milo")
                 .preamble(system_prompt)
+                .options(GenerationOptions::default().reasoning(reasoning(
+                    agent.reasoning_effort,
+                )))
                 .memory(agent.conversation_store.clone())
                 .tool(ProfileTool::new(
                     agent.profile_store.clone(),
@@ -152,14 +207,44 @@ impl<S: ProfileStore + 'static> Agent for RigAgent<S> {
                         output.push_str(&text);
                         yield AgentEvent::TextDelta(text);
                     }
-                    MultiTurnStreamItem::ModelTurnRetried { .. } => {
+                    MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Reasoning { text, .. })) => {
+                        yield AgentEvent::ReasoningDelta(text);
+                    }
+                    MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Arguments { part, json })) => {
+                        yield AgentEvent::ToolCall(ToolCallEvent {
+                            part: Some(part.index()),
+                            id: None,
+                            name: None,
+                            arguments: serde_json::Value::String(json),
+                            completed: false,
+                        });
+                    }
+                    MultiTurnStreamItem::ToolCall { tool_call } => {
+                        yield AgentEvent::ToolCall(tool_call_event(tool_call));
+                    }
+                    MultiTurnStreamItem::ToolResultItem { tool_result, index, count } => {
+                        yield AgentEvent::ToolResult(
+                            tool_result_event(tool_result, Some(index), Some(count), false)?
+                        );
+                    }
+                    MultiTurnStreamItem::ToolResult { tool_result } => {
+                        yield AgentEvent::ToolResult(tool_result_event(tool_result, None, None, true)?);
+                    }
+                    MultiTurnStreamItem::CompletionCall(call) => {
+                        yield AgentEvent::CompletionCall(CompletionCallEvent {
+                            call_index: call.call_index,
+                            usage: serde_json::to_value(call.usage)?,
+                            finish_reason: call.finish_reason.map(serde_json::to_value).transpose()?,
+                        });
+                    }
+                    MultiTurnStreamItem::ModelTurnRetried { turn } => {
                         output.clear();
-                        yield AgentEvent::Reset;
+                        yield AgentEvent::Retried { turn };
                     }
                     MultiTurnStreamItem::FinalResponse(response) => {
                         let output = response.output();
                         agent.compact_conversation_async(session_key);
-                        yield AgentEvent::Finished(output);
+                        yield AgentEvent::Completed(output);
                         return;
                     }
                     _ => {}
@@ -275,6 +360,7 @@ mod tests {
             api_key: "key".into(),
             base_url: "https://example.com/v1".into(),
             model: "test".into(),
+            reasoning_effort: ReasoningEffort::Medium,
             context_length: Some(1_000),
         };
         let settings = AgentConfig::default();
@@ -293,6 +379,7 @@ mod tests {
             api_key: "key".into(),
             base_url: "https://example.com/v1".into(),
             model: "test".into(),
+            reasoning_effort: ReasoningEffort::Medium,
             context_length: None,
         };
 

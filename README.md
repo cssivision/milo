@@ -87,18 +87,21 @@ response:
 curl -N http://127.0.0.1:3000/v1/chat/stream \
   -H 'Authorization: Bearer replace_with_a_long_random_token' \
   -H 'Content-Type: application/json' \
-  -d '{"message":"你好","conversation_id":"demo","user_id":"alice"}'
+  -d '{"message":"你好","session_id":"demo","user_id":"alice"}'
 ```
 
-It emits `delta`, `reset`, and `done` SSE events. The final `done` event
-contains the complete response text.
+It emits `text_delta`, `reasoning_delta`, `tool_call`, `tool_result`,
+`completion_call`, `retried`, `completed`, and `error` SSE events.
+Tool calls and results are streamed as incremental events, followed by an event
+whose `completed` field is `true`. The final `completed` event contains the
+complete response text.
 Provide a stable `user_id` to isolate sessions and profile files between HTTP
 users.
 
 ### Persistent Conversations
 
 Rig's filesystem-backed conversation memory persists each
-`channel + user_id + conversation_id` under `.milo/sessions/`. Per-user
+`channel + user_id + session_id` under `.milo/sessions/`. Per-user
 profiles remain in `.milo/profile/<user-hash>/user.md` and `soul.md`.
 
 `user.md` and `soul.md` are loaded into the system prompt for every request.

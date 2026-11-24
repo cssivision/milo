@@ -51,6 +51,8 @@ pub struct ModelConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    #[serde(default = "defaults::reasoning_effort")]
+    pub reasoning_effort: ReasoningEffort,
     #[serde(default)]
     pub context_length: Option<usize>,
 }
@@ -72,6 +74,18 @@ pub struct AgentConfig {
     pub compression_threshold_percent: Option<f64>,
     #[serde(default = "defaults::max_compression_attempts")]
     pub max_compression_attempts: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Off,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -219,13 +233,14 @@ fn validate_wecom(config: &WecomConfig) -> Result<()> {
 }
 
 mod defaults {
-    use super::AccessPolicy;
+    use super::{AccessPolicy, ReasoningEffort};
     use std::path::PathBuf;
 
     const WECOM_WS_URL: &str = "wss://openws.work.weixin.qq.com";
     const HTTP_LISTEN_ADDR: &str = "127.0.0.1:3000";
     const SYSTEM_PROMPT: &str =
         "You are a helpful assistant. Reply in the user's language and keep answers concise.";
+    const REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Medium;
     const MAX_HISTORY_MESSAGES: usize = 12;
     const COMPRESSION_THRESHOLD_PERCENT: f64 = 0.5;
     const MAX_COMPRESSION_ATTEMPTS: usize = 3;
@@ -247,6 +262,10 @@ mod defaults {
 
     pub(super) fn system_prompt() -> String {
         SYSTEM_PROMPT.to_owned()
+    }
+
+    pub(super) const fn reasoning_effort() -> ReasoningEffort {
+        REASONING_EFFORT
     }
 
     pub(super) const fn max_history_messages() -> usize {
@@ -294,6 +313,7 @@ mod tests {
                 api_key: "key".into(),
                 base_url: "https://example.com/v1".into(),
                 model: "model".into(),
+                reasoning_effort: defaults::reasoning_effort(),
                 context_length: None,
             },
             agent: AgentConfig::default(),
@@ -350,6 +370,7 @@ mod tests {
 
         config.validate().unwrap();
         assert_eq!(config.model.context_length, None);
+        assert_eq!(config.model.reasoning_effort, ReasoningEffort::Medium);
         assert_eq!(config.agent.compression_threshold_percent(), 0.5);
         assert_eq!(config.agent.max_compression_attempts, 3);
     }

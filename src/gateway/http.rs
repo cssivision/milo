@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     config::HttpConfig,
-    gateway::{AgentEvent, Channel, GatewayRuntime, InboundMessage},
+    gateway::{AgentEvent, Channel, GatewayEventType, GatewayRuntime, InboundMessage},
 };
 
 #[derive(Clone)]
@@ -28,7 +28,7 @@ struct HttpState {
 struct ChatRequest {
     message: String,
     #[serde(default)]
-    conversation_id: Option<String>,
+    session_id: Option<String>,
     #[serde(default)]
     user_id: Option<String>,
 }
@@ -74,35 +74,57 @@ async fn chat_stream(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let conversation_id = request
-        .conversation_id
+    let session_id = request
+        .session_id
         .filter(|id| !id.trim().is_empty())
         .unwrap_or_else(|| format!("http:{}", Uuid::new_v4()));
     let sender_id = request
         .user_id
         .filter(|id| !id.trim().is_empty())
         .unwrap_or_else(|| "http".to_owned());
-    info!("HTTP Gateway started a stream: conversation_id={conversation_id}");
+    info!("HTTP Gateway started a stream: session_id={session_id}");
     let inbound = InboundMessage {
         channel: Channel::Http,
         sender_id,
         message_id: Uuid::new_v4().to_string(),
-        conversation_id,
+        session_id,
         text: message.to_owned(),
     };
     let stream = state.gateway.dispatch_stream(inbound).map(|event| {
         let event = match event {
-            Ok(AgentEvent::TextDelta(text)) => {
-                sse_event("delta", serde_json::json!({ "text": text }))
+            Ok(AgentEvent::TextDelta(text)) => sse_event(
+                GatewayEventType::TextDelta,
+                serde_json::json!({ "text": text }),
+            ),
+            Ok(AgentEvent::ReasoningDelta(text)) => sse_event(
+                GatewayEventType::ReasoningDelta,
+                serde_json::json!({ "text": text }),
+            ),
+            Ok(AgentEvent::ToolCall(tool_call)) => {
+                sse_event(GatewayEventType::ToolCall, serde_json::json!(tool_call))
             }
-            Ok(AgentEvent::Reset) => sse_event("reset", serde_json::json!({})),
-            Ok(AgentEvent::Finished(text)) => {
-                sse_event("done", serde_json::json!({ "text": text }))
+            Ok(AgentEvent::ToolResult(tool_result)) => {
+                sse_event(GatewayEventType::ToolResult, serde_json::json!(tool_result))
             }
+            Ok(AgentEvent::CompletionCall(call)) => {
+                sse_event(GatewayEventType::CompletionCall, serde_json::json!(call))
+            }
+            Ok(AgentEvent::Retried { turn }) => sse_event(
+                GatewayEventType::Retried,
+                serde_json::json!({ "turn": turn }),
+            ),
+            Ok(AgentEvent::Completed(text)) => sse_event(
+                GatewayEventType::Completed,
+                serde_json::json!({ "text": text }),
+            ),
+            Ok(AgentEvent::Error(message)) => sse_event(
+                GatewayEventType::Error,
+                serde_json::json!({ "message": message }),
+            ),
             Err(_) => sse_event(
-                "done",
+                GatewayEventType::Error,
                 serde_json::json!({
-                    "text": "抱歉，暂时无法生成回复，请稍后重试。"
+                    "message": "抱歉，暂时无法生成回复，请稍后重试。"
                 }),
             ),
         };
@@ -120,8 +142,10 @@ fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
         .is_some_and(|value| value == expected)
 }
 
-fn sse_event(event: &str, data: serde_json::Value) -> Event {
-    Event::default().event(event).data(data.to_string())
+fn sse_event(event: GatewayEventType, data: serde_json::Value) -> Event {
+    Event::default()
+        .event(event.as_str())
+        .data(data.to_string())
 }
 
 #[cfg(test)]

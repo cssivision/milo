@@ -6,6 +6,8 @@ use std::{pin::Pin, sync::Arc};
 use anyhow::Result;
 use futures_util::{Stream, StreamExt};
 use log::warn;
+use serde::Serialize;
+use serde_json::Value;
 
 pub use http::serve as serve_http;
 pub use wecom::WecomBot;
@@ -19,7 +21,7 @@ pub enum Channel {
 #[derive(Debug, Clone)]
 pub struct InboundMessage {
     pub channel: Channel,
-    pub conversation_id: String,
+    pub session_id: String,
     pub sender_id: String,
     pub message_id: String,
     pub text: String,
@@ -28,8 +30,67 @@ pub struct InboundMessage {
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     TextDelta(String),
-    Reset,
-    Finished(String),
+    ReasoningDelta(String),
+    ToolCall(ToolCallEvent),
+    ToolResult(ToolResultEvent),
+    CompletionCall(CompletionCallEvent),
+    Retried { turn: usize },
+    Completed(String),
+    Error(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum GatewayEventType {
+    TextDelta,
+    ReasoningDelta,
+    ToolCall,
+    ToolResult,
+    CompletionCall,
+    Retried,
+    Completed,
+    Error,
+}
+
+impl GatewayEventType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TextDelta => "text_delta",
+            Self::ReasoningDelta => "reasoning_delta",
+            Self::ToolCall => "tool_call",
+            Self::ToolResult => "tool_result",
+            Self::CompletionCall => "completion_call",
+            Self::Retried => "retried",
+            Self::Completed => "completed",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCallEvent {
+    pub part: Option<usize>,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub arguments: Value,
+    pub completed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolResultEvent {
+    pub call_id: String,
+    pub name: String,
+    pub content: Vec<Value>,
+    pub is_error: bool,
+    pub index: Option<usize>,
+    pub count: Option<usize>,
+    pub completed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionCallEvent {
+    pub call_index: usize,
+    pub usage: Value,
+    pub finish_reason: Option<Value>,
 }
 
 pub type AgentStream = Pin<Box<dyn Stream<Item = Result<AgentEvent>> + Send>>;
@@ -58,7 +119,9 @@ impl GatewayRuntime {
                     Ok(event) => yield Ok(event),
                     Err(error) => {
                         warn!("agent stream failed: {error}");
-                        yield Ok(AgentEvent::Finished("抱歉，暂时无法生成回复，请稍后重试。".to_owned()));
+                        yield Ok(AgentEvent::Error(
+                            "抱歉，暂时无法生成回复，请稍后重试。".to_owned(),
+                        ));
                         return;
                     }
                 }
@@ -77,7 +140,7 @@ mod tests {
         fn respond_stream(&self, message: InboundMessage) -> AgentStream {
             Box::pin(async_stream::stream! {
                 yield Ok(AgentEvent::TextDelta(message.text.clone()));
-                yield Ok(AgentEvent::Finished(message.text));
+                yield Ok(AgentEvent::Completed(message.text));
             })
         }
     }
@@ -87,7 +150,7 @@ mod tests {
         let gateway = GatewayRuntime::new(EchoAgent);
         let mut stream = gateway.dispatch_stream(InboundMessage {
             channel: Channel::Wecom,
-            conversation_id: "dm:user-1".into(),
+            session_id: "dm:user-1".into(),
             sender_id: "user-1".into(),
             message_id: "message-1".into(),
             text: "hello".into(),
