@@ -1,26 +1,49 @@
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use getopts::Options;
 use log::info;
 use milo::{
-    agent::RigAgent,
+    agent::{RigAgent, profile::FileProfileStore},
     config::{Config, GatewayConfig},
     gateway::{GatewayRuntime, WecomBot, serve_http},
 };
 
-#[derive(Debug, Parser)]
-#[command(about = "WeCom Bot backed by a Rig agent")]
-struct Args {
-    /// TOML configuration file.
-    #[arg(short = 'c', long, default_value = "config.toml")]
-    config: PathBuf,
+fn parse_config_path() -> Result<PathBuf> {
+    let mut options = Options::new();
+    options.optopt("c", "config", "TOML configuration file", "PATH");
+    options.optflag("h", "help", "print this help message");
+
+    let program = env::args().next().unwrap_or_else(|| "milo".to_owned());
+    let matches = options.parse(env::args().skip(1)).map_err(|error| {
+        anyhow::anyhow!(
+            "{error}\n{}",
+            options.usage(&format!("Usage: {program} [options]"))
+        )
+    })?;
+
+    if matches.opt_present("h") {
+        print!("{}", options.usage(&format!("Usage: {program} [options]")));
+        std::process::exit(0);
+    }
+
+    if !matches.free.is_empty() {
+        anyhow::bail!(
+            "unexpected positional arguments: {}",
+            matches.free.join(" ")
+        );
+    }
+
+    Ok(matches
+        .opt_str("c")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("config.toml")))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
-    let config = Config::from_file(&args.config)?;
+    let config_path = parse_config_path()?;
+    let config = Config::from_file(&config_path)?;
     let log_level = config
         .log
         .level
@@ -29,13 +52,18 @@ async fn main() -> Result<()> {
     env_logger::Builder::new().filter_level(log_level).init();
 
     let gateway_count = config.gateway.len();
-    let agent = RigAgent::new(config.model, config.agent);
+    let agent = RigAgent::new(
+        config.model,
+        config.agent,
+        FileProfileStore::new(config.profile_dir),
+        config.storage_dir,
+    )?;
     let gateway = GatewayRuntime::new(agent);
     let mut tasks = tokio::task::JoinSet::new();
 
     info!(
         "starting milo: config={}, gateways={gateway_count}",
-        args.config.display()
+        config_path.display()
     );
     for config in config.gateway {
         let gateway = gateway.clone();

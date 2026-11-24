@@ -23,7 +23,7 @@ bearer_token = "replace_with_a_long_random_token"
 
 [model]
 # An OpenAI Chat Completions compatible endpoint.
-api_key = "your api key"
+api_key = "sk-cee5a3bbf6f249f2b8449529ff293a75"
 base_url = "https://api.deepseek.com"
 model = "deepseek-flash"
 

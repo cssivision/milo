@@ -1,88 +1,109 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
+use anyhow::Result;
 use futures_util::StreamExt;
 use rig::{
     agent::{AgentBuilder, MultiTurnStreamItem},
-    providers::openai::OpenAIConfig,
+    providers::openai::{OpenAI, OpenAIConfig},
     streaming::{Item, StreamEvent},
 };
-use tokio::sync::Mutex;
+use rig_memory::DirStore;
 
 use crate::{
+    agent::{
+        profile::{Profile, ProfileStore},
+        tools::ProfileTool,
+    },
     config::{AgentConfig, ModelConfig},
-    gateway::{Agent, AgentEvent, AgentStream, InboundMessage},
+    gateway::{Agent, AgentEvent, AgentStream, Channel, InboundMessage},
 };
 
-#[derive(Clone)]
-pub struct RigAgent {
-    model: ModelConfig,
+pub struct RigAgent<S: ProfileStore> {
+    client: OpenAI,
+    model_name: String,
     settings: AgentConfig,
-    histories: Arc<Mutex<HashMap<String, VecDeque<ConversationTurn>>>>,
+    profile_store: Arc<S>,
+    conversation_store: DirStore,
 }
 
-#[derive(Clone)]
-struct ConversationTurn {
-    user: String,
-    assistant: String,
-}
-
-impl RigAgent {
-    pub fn new(model: ModelConfig, settings: AgentConfig) -> Self {
+impl<S: ProfileStore> Clone for RigAgent<S> {
+    fn clone(&self) -> Self {
         Self {
-            model,
-            settings,
-            histories: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    async fn context_for(&self, session_id: &str, message: &str) -> String {
-        let histories = self.histories.lock().await;
-        let Some(history) = histories.get(session_id) else {
-            return message.to_owned();
-        };
-
-        let mut context = String::from("Conversation history:\n");
-        for turn in history {
-            context.push_str("User: ");
-            context.push_str(&turn.user);
-            context.push_str("\nAssistant: ");
-            context.push_str(&turn.assistant);
-            context.push('\n');
-        }
-        context.push_str("User: ");
-        context.push_str(message);
-        context
-    }
-
-    async fn save_turn(&self, session_id: &str, user: &str, assistant: &str) {
-        let mut histories = self.histories.lock().await;
-        let history = histories.entry(session_id.to_owned()).or_default();
-        history.push_back(ConversationTurn {
-            user: user.to_owned(),
-            assistant: assistant.to_owned(),
-        });
-        while history.len() > self.settings.max_history_messages {
-            history.pop_front();
+            client: self.client.clone(),
+            model_name: self.model_name.clone(),
+            settings: self.settings.clone(),
+            profile_store: self.profile_store.clone(),
+            conversation_store: self.conversation_store.clone(),
         }
     }
 }
 
-impl Agent for RigAgent {
+fn session_key(channel: Channel, sender_id: &str, conversation_id: &str) -> String {
+    format!("{channel:?}:{sender_id}:{conversation_id}")
+}
+
+fn profile_key(channel: Channel, sender_id: &str) -> String {
+    format!("{channel:?}:{sender_id}")
+}
+
+impl<S: ProfileStore + 'static> RigAgent<S> {
+    pub fn new(
+        model: ModelConfig,
+        settings: AgentConfig,
+        profile_store: S,
+        storage_dir: PathBuf,
+    ) -> Result<Self> {
+        let conversation_store = DirStore::open(storage_dir.join("sessions"))?;
+        Ok(Self {
+            client: OpenAIConfig::new(&model.api_key)
+                .with_base_url(&model.base_url)
+                .client(),
+            model_name: model.model,
+            settings,
+            profile_store: Arc::new(profile_store),
+            conversation_store,
+        })
+    }
+
+    fn system_prompt(&self, profile: &Profile) -> String {
+        let mut prompt = self.settings.system_prompt.clone();
+        if !profile.soul_md.is_empty() {
+            prompt.push_str("\n\nSoul:\n");
+            prompt.push_str(&profile.soul_md);
+        }
+        if !profile.user_md.is_empty() {
+            prompt.push_str("\n\nUser profile:\n");
+            prompt.push_str(&profile.user_md);
+        }
+        prompt
+    }
+
+    async fn context_for(&self, profile_key: &str, message: &str) -> Result<(String, String)> {
+        let profile = self.profile_store.load(profile_key).await?;
+        Ok((message.to_owned(), self.system_prompt(&profile)))
+    }
+}
+
+impl<S: ProfileStore + 'static> Agent for RigAgent<S> {
     fn respond_stream(&self, message: InboundMessage) -> AgentStream {
         let agent = self.clone();
         Box::pin(async_stream::try_stream! {
             let _metadata = (message.channel, &message.sender_id, &message.message_id);
-            let context = agent.context_for(&message.conversation_id, &message.text).await;
-            let client = OpenAIConfig::new(&agent.model.api_key)
-                .with_base_url(&agent.model.base_url)
-                .client();
-            let rig_agent = AgentBuilder::new(client.chat(&agent.model.model))
-                .preamble(&agent.settings.system_prompt)
+            let session_key =
+                session_key(message.channel, &message.sender_id, &message.conversation_id);
+            let profile_key = profile_key(message.channel, &message.sender_id);
+            let (context, system_prompt) = agent.context_for(&profile_key, &message.text).await?;
+            let rig_agent = AgentBuilder::new(agent.client.chat(&agent.model_name))
+                .name("milo")
+                .preamble(system_prompt)
+                .memory(agent.conversation_store.clone())
+                .tool(ProfileTool::new(
+                    agent.profile_store.clone(),
+                    profile_key,
+                ))
+                .default_max_turns(2)
                 .build();
-            let mut stream = rig_agent.prompt(&context).stream();
+            let mut stream = rig_agent.prompt(&context).conversation(session_key).stream();
             let mut output = String::new();
 
             while let Some(item) = stream.next().await {
@@ -97,7 +118,6 @@ impl Agent for RigAgent {
                     }
                     MultiTurnStreamItem::FinalResponse(response) => {
                         let output = response.output();
-                        agent.save_turn(&message.conversation_id, &message.text, &output).await;
                         yield AgentEvent::Finished(output);
                         return;
                     }
@@ -105,5 +125,18 @@ impl Agent for RigAgent {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_key_is_user_scoped() {
+        assert_ne!(
+            session_key(Channel::Http, "alice", "shared"),
+            session_key(Channel::Http, "bob", "shared")
+        );
     }
 }

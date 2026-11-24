@@ -87,11 +87,23 @@ response:
 curl -N http://127.0.0.1:3000/v1/chat/stream \
   -H 'Authorization: Bearer replace_with_a_long_random_token' \
   -H 'Content-Type: application/json' \
-  -d '{"message":"你好","conversation_id":"demo"}'
+  -d '{"message":"你好","conversation_id":"demo","user_id":"alice"}'
 ```
 
 It emits `delta`, `reset`, and `done` SSE events. The final `done` event
 contains the complete response text.
+Provide a stable `user_id` to isolate sessions and profile files between HTTP
+users.
+
+### Persistent Conversations
+
+Rig's filesystem-backed conversation memory persists each
+`channel + user_id + conversation_id` under `.milo/sessions/`. Per-user
+profiles remain in `.milo/profile/<user-hash>/user.md` and `soul.md`.
+
+`user.md` and `soul.md` are loaded into the system prompt for every request.
+The agent can selectively update its current user's `user.md` through the
+`profile` tool; it cannot modify `soul.md`.
 
 The application uses Tokio for the Bot WebSocket, reconnect and heartbeat
 tasks, and Rig's HTTP model requests.

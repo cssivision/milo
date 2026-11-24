@@ -29,6 +29,8 @@ struct ChatRequest {
     message: String,
     #[serde(default)]
     conversation_id: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
 }
 
 pub async fn serve(config: HttpConfig, gateway: GatewayRuntime) -> Result<()> {
@@ -76,10 +78,14 @@ async fn chat_stream(
         .conversation_id
         .filter(|id| !id.trim().is_empty())
         .unwrap_or_else(|| format!("http:{}", Uuid::new_v4()));
+    let sender_id = request
+        .user_id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| "http".to_owned());
     info!("HTTP Gateway started a stream: conversation_id={conversation_id}");
     let inbound = InboundMessage {
         channel: Channel::Http,
-        sender_id: "http".to_owned(),
+        sender_id,
         message_id: Uuid::new_v4().to_string(),
         conversation_id,
         text: message.to_owned(),
